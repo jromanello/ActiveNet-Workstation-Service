@@ -1,256 +1,666 @@
+#
+# ActiveNet Workstation Service (ANWS) PowerShell Module
+# Version: 2.0.0
+# Author: Justin Romanello
+#
+
 function Install-ANWS {
     <#
         .SYNOPSIS
-            This function installs the ActiveNet Workstation Service (ANWS) from a specified source or by downloading it.
-            Previous installations will be overwritten and a transcript log will be saved on the system drive.
+            Installs or updates the ActiveNet Workstation Service (ANWS) with official hardening.
+
+        .DESCRIPTION
+            Installs the ActiveNet Workstation Service from a specified archive or downloads the latest
+            distribution directly from ActiveNet. Configures enterprise hardening per ActiveNet technical
+            documentation:
+              - Enforces TLS 1.2 download transport.
+              - Pre-emptively terminates locking ActiveNet/Java processes.
+              - Dynamically locates MSI within nested zip archives.
+              - Executes silent MSI installation with verbose transaction logging.
+              - Applies Automatic Service Recovery configuration to both 'activenetworkstationservice'
+                and 'COMSysApp' (Doc 000152060).
+              - Enforces BUILTIN\Users Full Control on the installation directory (Doc 000157572).
+              - Configures SDDL restart permissions for Authenticated Users.
+              - Validates the localhost port 4444 WebSocket listener (Docs 000080830 & 000087155).
 
         .PARAMETER Source
-            Specifies the ANWS zip file to be used as the installer source. This parameter is mandatory if the 'Download' parameter is NOT used.
+            Specifies the path to an ANWS installation zip or installer package. Mandatory when Download is not specified.
 
         .PARAMETER Download
-            If this switch is used, the function will download the ANWS zip file from the ActiveNet website.
+            When specified, downloads the latest ANWS package directly from ActiveNet.
 
         .PARAMETER Destination
-            This parameter is mandatory. It specifies a temporary working directory. This destination is where the ANWS zip file
-            will be saved and extracted. Files will be removed upon completion.
+            Working directory for downloading and extracting installer assets. Defaults to "$env:TEMP\ANWS_Install".
+
+        .PARAMETER CreateShortcut
+            When specified, creates a hidden restart batch file and a desktop shortcut ("Restart ActiveNet.lnk") on the Public Desktop.
 
         .EXAMPLE
-            PS> Install-ANWS -Download -Destination 'C:\Temp'
-
-            This example downloads the ANWS zip file from the ActiveNet website and installs it.
-            The zip file is saved and extracted in the 'C:\Temp' directory.
+            PS> Install-ANWS -Download
 
         .EXAMPLE
-            PS> Install-ANWS -Source "\\Server\ANWS Downloads\activenetworkstationservice.zip" -Destination 'C:\Temp'
+            PS> Install-ANWS -Download -Destination 'C:\Temp' -CreateShortcut
 
-            This example uses the specified ANWS zip file as the installer source.
-            The zip file is saved and extracted in the 'C:\Temp' directory.
+        .EXAMPLE
+            PS> Install-ANWS -Source "\\Server\Share\activenetworkstationservice.zip"
     #>
-
     [CmdletBinding(DefaultParameterSetName='Source')]
+    [Alias('Install-ActiveNet')]
     param (      
-        [Parameter(ParameterSetName='Source', Mandatory=$true)]
+        [Parameter(ParameterSetName='Source', Mandatory=$true, Position=0)]
         [string]$Source, 
 
-        [Parameter(ParameterSetName='Download')]
+        [Parameter(ParameterSetName='Download', Mandatory=$true)]
         [switch]$Download,
         
-        [Parameter(Mandatory=$true)]
-        [string]$Destination
+        [Parameter(ParameterSetName='Source', Mandatory=$false)]
+        [Parameter(ParameterSetName='Download', Mandatory=$false)]
+        [string]$Destination = "$env:TEMP\ANWS_Install",
+
+        [Parameter(Mandatory=$false)]
+        [Alias('Shortcut')]
+        [switch]$CreateShortcut
     )
 
-    # Variables
-    $logFile = "$((Get-CimInstance -ClassName CIM_OperatingSystem).SystemDrive)\ANWS_Log_$(Get-Date -Format MMddHHmm).txt"
-    $anws = 'activenetworkstationservice'
-    $extract = Join-Path -Path $destination -ChildPath 'Extract'
-    $msi = "{0}\{1}Installer.msi" -f $extract, $anws
-    $aN = 'ActiveNet Workstation Service'
-
-    # Start transcript
-    Start-Transcript -Append $logFile
-
-    # Check path
-    if (!(Test-Path -Path $destination)) {
-        Write-Verbose "Creating directory $destination" -Verbose
-        New-Item -ItemType Directory -Path $destination | Out-Null
+    $serviceName = 'activenetworkstationservice'
+    $displayName = 'ActiveNet Workstation Service'
+    $installPath = if (${env:ProgramFiles(x86)}) {
+        Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath $displayName
+    } else {
+        Join-Path -Path $env:ProgramFiles -ChildPath $displayName
     }
+    $extractPath = Join-Path -Path $Destination -ChildPath 'Extract'
+    $zipPath = Join-Path -Path $Destination -ChildPath "$serviceName.zip"
+    $msiLog = Join-Path -Path $env:TEMP -ChildPath 'ANWS_msi_install.log'
+    $transcriptLog = Join-Path -Path $env:TEMP -ChildPath "ANWS_Install_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
 
-    # Download from ActiveNet if parameter was used
-    if ($download) {
-        $url = "https://activenetmaint.active.com/upgrade/$anws.zip"
-        $zip = "{0}\{1}.zip" -f $destination, $anws
-        $maxRetries = 5
-        
-        # Check connection to URL
-        if (([System.Net.WebRequest]::Create($url)).GetResponse().StatusCode -eq 'OK') {
-            $retryCount = 0
+    try {
+        Start-Transcript -Path $transcriptLog -Append -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
+
+    Write-Verbose "=== ActiveNet Workstation Service Modernized Installation ==="
+    Write-Verbose "Working Directory: $Destination"
+    Write-Verbose "Target Install Path: $installPath"
+
+    try {
+        if (-not (Test-Path -Path $Destination)) {
+            Write-Verbose "Creating directory '$Destination'..."
+            New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+        }
+
+        # Step 1: Acquire installer package (Download or Copy)
+        if ($Download) {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+
+            $downloadUrl = "https://activenetmaint.active.com/upgrade/$serviceName.zip"
+            Write-Verbose "Downloading ANWS package from '$downloadUrl'..."
+
             $downloadComplete = $false
+            $maxRetries = 5
+            $retryInterval = 2
 
-            # Retry download until it's successful or max retries reached
-            while (-not $downloadComplete -and $retryCount -lt $maxRetries) {
-                # Download latest ANWS
-                # Start-BitsTransfer -Source $url -Destination $zip -DisplayName "Downloading File" -Priority High     # Not using because issues with BITS
-                # Invoke-WebRequest -Uri $url -OutFile $destination     # Use if you need a progress bar
-                (New-Object Net.WebClient).DownloadFile($url,$zip)
-                
-                # Verify download
-                if (Test-Path $zip) {
-                    Write-Verbose -Message 'Download complete' -Verbose
-                    $downloadComplete = $true
-                } else {
-                    Write-Verbose -Message 'Download failed, retrying...' -Verbose
-                    $retryCount++
+            for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+                Write-Verbose "Download attempt $attempt of $maxRetries..."
+                try {
+                    if ($PSVersionTable.PSVersion.Major -ge 6) {
+                        Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -TimeoutSec 120 -ErrorAction Stop
+                    } else {
+                        Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+                    }
+
+                    if ((Test-Path -Path $zipPath) -and ((Get-Item -Path $zipPath).Length -gt 0)) {
+                        Write-Verbose "Download verified ($((Get-Item -Path $zipPath).Length) bytes)."
+                        $downloadComplete = $true
+                        break
+                    }
+                } catch {
+                    Write-Verbose "Invoke-WebRequest attempt failed: $($_.Exception.Message)"
+                    try {
+                        Write-Verbose "Attempting WebClient fallback..."
+                        $webClient = New-Object System.Net.WebClient
+                        $webClient.DownloadFile($downloadUrl, $zipPath)
+                        if ((Test-Path -Path $zipPath) -and ((Get-Item -Path $zipPath).Length -gt 0)) {
+                            Write-Verbose "WebClient download verified."
+                            $downloadComplete = $true
+                            break
+                        }
+                    } catch {
+                        Write-Verbose "WebClient fallback failed: $($_.Exception.Message)"
+                    }
+
+                    if ($attempt -lt $maxRetries) {
+                        Start-Sleep -Seconds $retryInterval
+                    }
                 }
             }
-            
+
             if (-not $downloadComplete) {
-                Write-Verbose -Message 'Download failed after maximum retries' -Verbose
+                throw "Failed to download ActiveNet package from '$downloadUrl' after $maxRetries attempts."
             }
         } else {
-            # URL connection failed test
-            Write-Verbose -Message "Could not reach $url" -Verbose
-            return
+            if (-not (Test-Path -Path $Source)) {
+                throw "Specified Source path does not exist: '$Source'"
+            }
+
+            $sourceItem = Get-Item -Path $Source
+            if ($sourceItem.Extension -ieq '.zip') {
+                Write-Verbose "Copying source archive from '$Source' to '$Destination'..."
+                Copy-Item -Path $Source -Destination $Destination -Force
+                $zipPath = Join-Path -Path $Destination -ChildPath $sourceItem.Name
+            } elseif ($sourceItem.Extension -ieq '.msi') {
+                Write-Verbose "Source is a direct MSI file."
+                $directMsiPath = $sourceItem.FullName
+            } else {
+                throw "Source file must be a .zip or .msi file. Provided: '$Source'"
+            }
         }
-    } else {
-        # Copy zip from specified source 
-        if ($source -like "*.zip*") {
-            Copy-Item -Path $source -Destination $destination
-            $fileName = Split-Path $source -Leaf
-            $zip = Join-Path -Path $destination -ChildPath $fileName
+
+        # Step 2: Extraction
+        if (-not $directMsiPath) {
+            if (-not (Test-Path -Path $zipPath)) {
+                throw "Archive file '$zipPath' not found for extraction."
+            }
+
+            if (Test-Path -Path $extractPath) {
+                Remove-Item -Path $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
+
+            Write-Verbose "Extracting installer archive to '$extractPath'..."
+            Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+            $msiFile = Get-ChildItem -Path $extractPath -Filter '*.msi' -Recurse | Select-Object -First 1
+            if (-not $msiFile) {
+                throw "No MSI package (*.msi) found inside extracted archive at '$extractPath'."
+            }
+            $targetMsi = $msiFile.FullName
         } else {
-            Write-Verbose -Message 'Source must be zip extension' -Verbose
-            return
+            $targetMsi = $directMsiPath
         }
-    }
 
-    if (Test-Path $zip) {
-        # Extract
+        Write-Verbose "Resolved MSI target: '$targetMsi'"
+
+        # Step 3: Pre-install process & service cleanup
+        Write-Verbose "Stopping service '$serviceName' if running..."
+        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+
+        Write-Verbose "Terminating potential locking ActiveNet/Java processes..."
+        $processNames = @('ActiveNet.ServiceContainer', 'ANWorkstationConfigurationUI', 'java', 'javaw')
+        foreach ($pName in $processNames) {
+            $foundProcs = Get-Process -Name $pName -ErrorAction SilentlyContinue
+            foreach ($proc in $foundProcs) {
+                $shouldKill = $false
+                if ($pName -in @('java', 'javaw')) {
+                    try {
+                        $pPath = $proc.MainModule.FileName
+                        if ($pPath -and ($pPath -like "*$installPath*" -or $pPath -like "*ActiveNet*")) {
+                            $shouldKill = $true
+                        }
+                    } catch {
+                        $shouldKill = $true
+                    }
+                } else {
+                    $shouldKill = $true
+                }
+
+                if ($shouldKill) {
+                    Write-Verbose "Terminating process '$($proc.ProcessName)' (PID: $($proc.Id))..."
+                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        # Step 4: Silent MSI installation
+        Write-Verbose "Executing silent MSI installation..."
+        $msiArgs = @('/i', "`"$targetMsi`"", '/qn', '/norestart', '/l*v', "`"$msiLog`"")
+        $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+
+        if ($proc.ExitCode -notin @(0, 3010)) {
+            throw "MSI installation failed with exit code $($proc.ExitCode). Review installer log at '$msiLog'."
+        }
+        Write-Verbose "MSI installation succeeded with exit code $($proc.ExitCode)."
+
+        # Step 5: Official ActiveNet Hardening & Configuration
+        # 5a. Automatic Service Recovery Options (Doc 000152060)
+        Write-Verbose "Configuring Automatic Service Recovery for '$serviceName'..."
+        & sc.exe failure $serviceName reset= 0 actions= restart/60000/restart/60000/restart/60000 2>&1 | Out-Null
+
+        Write-Verbose "Configuring Automatic Service Recovery for COM+ System Application ('COMSysApp')..."
+        & sc.exe failure COMSysApp reset= 0 actions= restart/60000/restart/60000/restart/60000 2>&1 | Out-Null
+
+        # 5b. Startup Type Automatic and Service Start
+        Write-Verbose "Setting '$serviceName' startup type to Automatic..."
+        Set-Service -Name $serviceName -StartupType Automatic -ErrorAction SilentlyContinue
+
+        Write-Verbose "Starting service '$serviceName'..."
+        Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+
+        # 5c. Directory Permissions for BUILTIN\Users (Doc 000157572)
+        if (Test-Path -Path $installPath) {
+            Write-Verbose "Granting Full Control on '$installPath' to BUILTIN\Users (*S-1-5-32-545)..."
+            & icacls.exe "$installPath" /grant "*S-1-5-32-545:(OI)(CI)F" /T /C /Q 2>&1 | Out-Null
+        }
+
+        # 5d. SDDL Restart Permissions for Authenticated Users
+        Write-Verbose "Configuring Authenticated Users restart SDDL permissions..."
+        $sddl = 'D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;RPWPCR;;;AU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)'
+        & sc.exe sdset $serviceName $sddl 2>&1 | Out-Null
+
+        # 5e. Desktop Shortcut Configuration
+        if ($CreateShortcut) {
+            Write-Verbose "Creating desktop restart shortcut..."
+            Set-ANWSRestart
+        }
+
+        # Step 6: Cleanup temporary files
+        Write-Verbose "Cleaning up temporary installation assets..."
+        if (Test-Path -Path $extractPath) {
+            Remove-Item -Path $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if ($zipPath -and (Test-Path -Path $zipPath) -and ($zipPath -like "$Destination*")) {
+            Remove-Item -Path $zipPath -Force -ErrorAction SilentlyContinue
+        }
+
+        # Step 7: Port 4444 Verification (Docs 000080830 & 000087155)
+        Write-Verbose "Verifying localhost port 4444 WebSocket listener..."
+        $portListening = $false
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt 15) {
+            try {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                $asyncResult = $tcpClient.BeginConnect('127.0.0.1', 4444, $null, $null)
+                if ($asyncResult.AsyncWaitHandle.WaitOne(1000, $false) -and $tcpClient.Connected) {
+                    $tcpClient.EndConnect($asyncResult)
+                    $tcpClient.Close()
+                    $portListening = $true
+                    break
+                }
+                $tcpClient.Close()
+            } catch {}
+            Start-Sleep -Milliseconds 500
+        }
+        $sw.Stop()
+
+        # Step 8: Final Status Reporting
+        $svcStatus = (Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status
+        Write-Verbose "ActiveNet Workstation Service Status: $svcStatus | Port 4444 Listening: $portListening"
+        Write-Output "ActiveNet Workstation Service installed successfully (Status: $svcStatus, Port 4444: $portListening)."
+    } catch {
+        Write-Error "ActiveNet Workstation Service installation failed: $($_.Exception.Message)"
+        throw $_
+    } finally {
         try {
-            New-Item -ItemType Directory -Path $extract | Out-Null
-            Expand-Archive -Path $zip -DestinationPath $extract -Force -ErrorAction Stop
-            Write-Verbose -Message 'Extraction complete' -Verbose
-        } catch {
-            Write-Verbose -Message "Error: $($_.Exception.Message)" -Verbose
-        }
-
-        # Install
-        $msiArgs = @(
-            '/i'
-            ('"{0}"' -f "$msi")
-            '/qn'
-        ) 
-        Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -NoNewWindow
-
-        # Set automatic service restart upon failure
-        cmd /c sc failure $anws reset= 0 actions= restart/0 | Out-Null
-    } else {
-        Write-Verbose -Message "$zip not found" -Verbose
-        return
+            Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+        } catch {}
     }
-
-    # Verify installation
-    $anPkg = Get-Package "$aN" -ErrorAction Ignore
-    if ($anPkg) {
-        $version = $anPkg.version
-    } else {
-        Write-Verbose "problem with $aN installation"
-        return
-    }
-    
-    # Cleanup
-    Remove-Item -Path $zip -Force
-    Remove-Item -Path $extract -Recurse -Force
-
-    # Stop transcript
-    Write-Verbose -Message "ActiveNet Workstation Service v$version installed" -Verbose
-    Stop-Transcript
 }
 
 function Set-ANWSRestart {
     <#
-    .SYNOPSIS
-        The function will grant permissions to authenticated users to restart restart the ActiveNet Workstation Service service and
-        create a shortcut to do so.
-    
-    .PARAMETER Destination
-        The path where the shortcut should be created. If not specified, the function will default to the Public Desktop.
+        .SYNOPSIS
+            Grants restart permissions to Authenticated Users and creates a desktop restart shortcut.
 
-    .EXAMPLE
-        PS> Set-ANWSRestart
+        .DESCRIPTION
+            Configures the ActiveNet Workstation Service (activenetworkstationservice) SDDL security
+            descriptor so Authenticated Users can start and stop the service without local administrator
+            rights. Generates a hidden batch script (restartanws.bat) and a desktop shortcut (Restart ActiveNet.lnk)
+            for ease of use by front-desk and recreation staff.
+
+        .PARAMETER ShortcutLocation
+            Directory where the restart batch file and desktop shortcut are placed. Defaults to Public Desktop ($env:PUBLIC\Desktop).
+
+        .EXAMPLE
+            PS> Set-ANWSRestart
+
+        .EXAMPLE
+            PS> Set-ANWSRestart -ShortcutLocation "C:\Users\Public\Desktop"
     #>
-
+    [CmdletBinding()]
     param(
-        [string]$ShortcutLocation = "$env:PUBLIC\desktop"
+        [Parameter(Mandatory=$false)]
+        [string]$ShortcutLocation = "$env:PUBLIC\Desktop"
     )
 
-    # Variables
-    $anws = 'activenetworkstationservice'
+    $serviceName = 'activenetworkstationservice'
+    $sddl = 'D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;RPWPCR;;;AU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)'
 
     try {
-        # Permission to let authenticated users restart ANWS
-        cmd /c sc sdset $anws "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;RPWPCR;;;AU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)" 
-        
-        # Create bat
-        New-Item -Path $shortcutLocation -Name 'restartanws.bat' -Value "net stop $anws `nnet start $anws" -force -ErrorAction SilentlyContinue | Out-Null
-        [System.IO.File]::SetAttributes("$shortcutlocation\restartanws.bat", 'Hidden')
+        Write-Verbose "Applying SDDL restart permissions to service '$serviceName'..."
+        $sdResult = & sc.exe sdset $serviceName $sddl 2>&1
+        Write-Verbose "sc.exe sdset output: $sdResult"
 
-        # Create shortcut
-        $wshshell = New-Object -ComObject ("WScript.Shell")
-        $shortcut = $wshShell.CreateShortcut((Join-Path $shortcutLocation "Restart ActiveNet.lnk"))
-        $shortcut.TargetPath = "$shortcutLocation\restartanws.bat"
-        $shortcut.IconLocation = 'C:\Windows\System32\shell32.dll,238'
+        if (-not (Test-Path -Path $ShortcutLocation)) {
+            Write-Verbose "Creating directory '$ShortcutLocation'..."
+            New-Item -ItemType Directory -Path $ShortcutLocation -Force | Out-Null
+        }
+
+        # Create restart batch file
+        $batPath = Join-Path -Path $ShortcutLocation -ChildPath 'restartanws.bat'
+        $batContent = "@echo off`r`nnet stop $serviceName`r`nnet start $serviceName`r`n"
+        Set-Content -Path $batPath -Value $batContent -Encoding ASCII -Force
+        
+        # Hide the batch file to prevent desktop clutter
+        try {
+            [System.IO.File]::SetAttributes($batPath, [System.IO.FileAttributes]::Hidden)
+        } catch {
+            Write-Verbose "Could not set hidden attribute on '$batPath': $($_.Exception.Message)"
+        }
+
+        # Create shortcut via WScript.Shell
+        $lnkPath = Join-Path -Path $ShortcutLocation -ChildPath 'Restart ActiveNet.lnk'
+        Write-Verbose "Creating shortcut at '$lnkPath'..."
+        $wshShell = New-Object -ComObject 'WScript.Shell'
+        $shortcut = $wshShell.CreateShortcut($lnkPath)
+        $shortcut.TargetPath = $batPath
+        $shortcut.WorkingDirectory = $ShortcutLocation
+        $shortcut.Description = 'Restart ActiveNet Workstation Service'
+        $shortcut.IconLocation = "$env:SystemRoot\System32\shell32.dll,238"
         $shortcut.Save()
+
+        Write-Verbose "Restart permissions and desktop shortcut configured successfully at '$lnkPath'."
     } catch {
-        Write-Verbose -Message "An error occurred: $($_.Exception.Message)" -Verbose
+        Write-Error "Failed to configure ANWS restart permissions or shortcut: $($_.Exception.Message)"
+        throw $_
     }
 }
 
 function Uninstall-ANWS {
     <#
         .SYNOPSIS
-            This function is used to uninstall ActiveNet Workstation Service. PowerShell 5 is started to ensure functionality.
-            If an installation is detected it will check to make sure the service exists and that Java is stopped before uninstallation.
-            After uninstallation it will verify the service has been removed as well as anything left behind in Program Files.
-            
+            Uninstalls the ActiveNet Workstation Service with hardened cleanup and corruption recovery.
+
+        .DESCRIPTION
+            Natively uninstalls the ActiveNet Workstation Service (ANWS) across Windows PowerShell 5.1
+            and PowerShell 7+ without external subprocess dependencies. Detects product registrations via
+            both 64-bit and WOW6432Node uninstall registry hives.
+
+            Includes automated self-healing for common MSI Error 1603 conditions by recreating service stubs
+            if a prior corrupted uninstallation deleted the Windows service while leaving MSI metadata intact.
+            Gracefully stops services, terminates locking Java/ActiveNet processes, executes silent MSI removal,
+            and validates full post-uninstallation cleanup of orphaned services, registry keys, directories,
+            and desktop shortcuts.
+
         .EXAMPLE
-            PS> Uninstall-ActiveNet
+            PS> Uninstall-ANWS
+
+        .EXAMPLE
+            PS> Uninstall-ActiveNet -Verbose
     #>
-            
-    function Uninstall-ActiveNet () {
-        # Variables
-        $activeNet = 'ActiveNet Workstation Service'
-        $installPath = $installPath = "$env:ProgramFiles(x86)\$ActiveNet"
-        $logFile = "$((Get-CimInstance -ClassName CIM_OperatingSystem).SystemDrive)\ANWS_UnInstall_Log_$(Get-Date -Format MMddHHmm).txt"
+    [CmdletBinding()]
+    [Alias('Uninstall-ActiveNet')]
+    param()
 
-        # Start Transcript
-        Start-Transcript -Append $logFile
+    $serviceName = 'activenetworkstationservice'
+    $displayName = 'ActiveNet Workstation Service'
+    $installPath = if (${env:ProgramFiles(x86)}) {
+        Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath $displayName
+    } else {
+        Join-Path -Path $env:ProgramFiles -ChildPath $displayName
+    }
+    $msiLog = Join-Path -Path $env:TEMP -ChildPath 'ANWS_msi_uninstall.log'
 
-        try {
-            # Check for ANWS and Uninstall if Found
-            $installCheck = Get-Package -Name $activeNet -ErrorAction Stop
+    Write-Verbose "Beginning uninstallation workflow for $displayName..."
 
-            if ($installCheck) {
-                # Installation w/ missing service indicates a previous corrupt uninstall attempt and package uninstallation will fail
-                Write-Verbose -Message "Found $activeNet" -Verbose
-                if (!(Get-Service -DisplayName $activeNet -ErrorAction SilentlyContinue)) {
-                    New-Service -Name 'ActiveNetWorkstationService' -BinaryPathName 'C:\Program Files (x86)\ActiveNet Workstation Service\ActiveNet.ServiceContainer.exe'
-                }
-            
-                # Newer ANWS versions include a java folder
-                if (Get-Process -Name java -ErrorAction SilentlyContinue) {
-                    Stop-Process -Name java -Force
-                }
-            
-                # Uninstall 
-                Stop-Service -DisplayName $activeNet -Force
-                Uninstall-Package -Name 'ActiveNet Workstation Service' -Force
-                Write-Verbose -Message 'Uninstalled' -Verbose
-            }
+    # Step 1: Detect installation in registry (64-bit and WOW6432Node)
+    $regPaths = @(
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+
+    $installedEntries = Get-ItemProperty -Path $regPaths -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -and ($_.DisplayName -like "*$displayName*" -or $_.DisplayName -like "*ActiveNet Workstation*") }
+
+    $productCodes = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in $installedEntries) {
+        Write-Verbose "Detected registry registration: '$($entry.DisplayName)' at $($entry.PSPath)"
+        if ($entry.InstallLocation -and (Test-Path -Path $entry.InstallLocation)) {
+            $installPath = $entry.InstallLocation
         }
-        catch {
-            Write-Verbose -Message 'Not Found' -Verbose
-            Write-Verbose -Message "Error: $($_.Exception.Message)" -Verbose
-        }
-        finally {
-            # Service Removal Double Check
-            if (Get-Service -DisplayName $activeNet -ErrorAction SilentlyContinue) {
-                cmd /c sc delete activenetworkstationservice
+
+        # Check for GUID product code in PSChildName or UninstallString
+        if ($entry.PSChildName -match '^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$') {
+            if (-not $productCodes.Contains($entry.PSChildName)) {
+                $productCodes.Add($entry.PSChildName)
             }
-        
-            # Orphaned Files Check
-            if (Test-Path $installPath) {
-                Remove-Item $installPath -Recurse -Force -ErrorAction Stop
+        } elseif ($entry.UninstallString -match '\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}') {
+            if (-not $productCodes.Contains($matches[0])) {
+                $productCodes.Add($matches[0])
             }
-            
-            Stop-Transcript
         }
     }
 
-    $major = $PSVersionTable.PSVersion.Major
+    # Step 2: Handle corrupted state (MSI registered but Windows service missing -> causes MSI Error 1603)
+    $serviceExists = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if ($productCodes.Count -gt 0 -and -not $serviceExists) {
+        Write-Verbose "MSI product registered but Windows service '$serviceName' is missing. Recreating service stub to prevent MSI 1603..."
+        $stubBinary = Join-Path -Path $installPath -ChildPath 'ActiveNet.ServiceContainer.exe'
+        try {
+            New-Service -Name $serviceName -DisplayName $displayName -BinaryPathName "`"$stubBinary`"" -StartupType Disabled -ErrorAction SilentlyContinue | Out-Null
+            Write-Verbose "Dummy service stub successfully staged."
+        } catch {
+            Write-Verbose "Unable to create dummy service stub: $($_.Exception.Message)"
+        }
+    }
 
-    if ($major -eq 5) {
-        Uninstall-ActiveNet
+    # Step 3: Pre-uninstall process & service termination
+    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+        Write-Verbose "Stopping service '$serviceName'..."
+        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Verbose "Terminating potential locking processes..."
+    $processNames = @('ActiveNet.ServiceContainer', 'ANWorkstationConfigurationUI', 'java', 'javaw')
+    foreach ($pName in $processNames) {
+        $foundProcs = Get-Process -Name $pName -ErrorAction SilentlyContinue
+        foreach ($proc in $foundProcs) {
+            $shouldKill = $false
+            if ($pName -in @('java', 'javaw')) {
+                try {
+                    $pPath = $proc.MainModule.FileName
+                    if ($pPath -and ($pPath -like "*$installPath*" -or $pPath -like "*ActiveNet*")) {
+                        $shouldKill = $true
+                    }
+                } catch {
+                    $shouldKill = $true
+                }
+            } else {
+                $shouldKill = $true
+            }
+
+            if ($shouldKill) {
+                Write-Verbose "Terminating locking process '$($proc.ProcessName)' (PID: $($proc.Id))..."
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # Step 4: Silent MSI uninstallation
+    if ($productCodes.Count -gt 0) {
+        foreach ($code in $productCodes) {
+            Write-Verbose "Executing MSI uninstallation for ProductCode '$code'..."
+            $msiArgs = @('/x', $code, '/qn', '/norestart', '/l*v', "`"$msiLog`"")
+            $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+            Write-Verbose "msiexec /x exited with code $($proc.ExitCode)."
+        }
     } else {
-        powershell -command ${Function:Uninstall-ActiveNet}
+        Write-Verbose "No active MSI ProductCode entries detected in registry. Proceeding to post-uninstall cleanup..."
+    }
+
+    # Step 5: Post-uninstall double check & purge
+    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+        Write-Verbose "Service '$serviceName' still registered post-MSI. Deleting via sc.exe..."
+        & sc.exe delete $serviceName 2>&1 | Out-Null
+    }
+
+    $serviceRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+    if (Test-Path -Path $serviceRegPath) {
+        Write-Verbose "Purging orphaned service registry key at '$serviceRegPath'..."
+        Remove-Item -Path $serviceRegPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Start-Sleep -Seconds 2
+    if (Test-Path -Path $installPath) {
+        Write-Verbose "Removing residual installation folder at '$installPath'..."
+        Remove-Item -Path $installPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $targetShortcutDirs = @(
+        "$env:PUBLIC\Desktop",
+        [Environment]::GetFolderPath('Desktop'),
+        [Environment]::GetFolderPath('CommonDesktopDirectory')
+    ) | Select-Object -Unique
+
+    $cleanupFiles = @('Restart ActiveNet.lnk', 'restartanws.bat', 'ActiveNet.url')
+    foreach ($dir in $targetShortcutDirs) {
+        if (Test-Path -Path $dir) {
+            foreach ($file in $cleanupFiles) {
+                $itemPath = Join-Path -Path $dir -ChildPath $file
+                if (Test-Path -Path $itemPath) {
+                    Write-Verbose "Removing shortcut/script file at '$itemPath'..."
+                    Remove-Item -Path $itemPath -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+
+    Write-Verbose "ActiveNet Workstation Service uninstallation and cleanup completed."
+}
+
+function Restart-ANWS {
+    <#
+        .SYNOPSIS
+            Restarts the ActiveNet Workstation Service and verifies the port 4444 listener.
+
+        .DESCRIPTION
+            Stops the ActiveNet Workstation Service (activenetworkstationservice), terminates any orphaned
+            service processes if necessary, starts the service, and verifies that the localhost port 4444
+            WebSocket listener is active and accepting connections.
+
+        .PARAMETER TimeoutSeconds
+            The maximum time in seconds to wait for the service to start and the port 4444 listener to respond.
+            Defaults to 30 seconds.
+
+        .OUTPUTS
+            [PSCustomObject] containing ServiceName, Status, Port4444Listening, and Success.
+
+        .EXAMPLE
+            PS> Restart-ANWS
+
+        .EXAMPLE
+            PS> Restart-ActiveNet -TimeoutSeconds 45
+    #>
+    [CmdletBinding()]
+    [Alias('Restart-ActiveNet')]
+    param(
+        [Parameter(Mandatory=$false)]
+        [int]$TimeoutSeconds = 30
+    )
+
+    $serviceName = 'activenetworkstationservice'
+    Write-Verbose "Querying status of service '$serviceName'..."
+
+    $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if (-not $service) {
+        Write-Error "Service '$serviceName' was not found on this system. Verify ActiveNet Workstation Service is installed."
+        return [PSCustomObject]@{
+            ServiceName       = $serviceName
+            Status            = 'NotFound'
+            Port4444Listening = $false
+            Success           = $false
+        }
+    }
+
+    # Stop service if running
+    if ($service.Status -ne 'Stopped') {
+        Write-Verbose "Stopping service '$serviceName'..."
+        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+        
+        $stopWait = 0
+        while ((Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status -ne 'Stopped' -and $stopWait -lt 10) {
+            Start-Sleep -Seconds 1
+            $stopWait++
+        }
+
+        if ((Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status -ne 'Stopped') {
+            Write-Verbose "Service failed to stop gracefully within 10s. Forcing process termination..."
+            Get-Process -Name 'ActiveNet.ServiceContainer' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        }
+    }
+
+    # Start service
+    Write-Verbose "Starting service '$serviceName'..."
+    Start-Service -Name $serviceName -ErrorAction Stop
+
+    # Wait for service status to reach Running
+    $serviceStarted = $false
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $currentStatus = (Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status
+        if ($currentStatus -eq 'Running') {
+            $serviceStarted = $true
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    if (-not $serviceStarted) {
+        Write-Warning "Service '$serviceName' did not reach 'Running' state within $TimeoutSeconds seconds."
+    } else {
+        Write-Verbose "Service '$serviceName' is running. Verifying WebSocket listener on localhost:4444..."
+    }
+
+    # Validate localhost port 4444 listener
+    $portListening = $false
+    while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $asyncResult = $tcpClient.BeginConnect('127.0.0.1', 4444, $null, $null)
+            $waitSuccess = $asyncResult.AsyncWaitHandle.WaitOne(1000, $false)
+            if ($waitSuccess -and $tcpClient.Connected) {
+                $tcpClient.EndConnect($asyncResult)
+                $tcpClient.Close()
+                $portListening = $true
+                break
+            }
+            $tcpClient.Close()
+        } catch {
+            # Retry until timeout
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    $stopwatch.Stop()
+
+    $finalStatus = (Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status
+    $isSuccess = ($finalStatus -eq 'Running') -and $portListening
+
+    if ($isSuccess) {
+        Write-Verbose "ActiveNet Workstation Service restarted successfully and verified on port 4444."
+    } else {
+        Write-Warning "ActiveNet Workstation Service restart finished with warnings. Running: $($finalStatus -eq 'Running'), Port 4444 Open: $portListening."
+    }
+
+    return [PSCustomObject]@{
+        ServiceName       = $serviceName
+        Status            = [string]$finalStatus
+        Port4444Listening = $portListening
+        Success           = $isSuccess
     }
 }
+
+# Aliases
+Set-Alias -Name 'Install-ActiveNet' -Value 'Install-ANWS'
+Set-Alias -Name 'Uninstall-ActiveNet' -Value 'Uninstall-ANWS'
+Set-Alias -Name 'Restart-ActiveNet' -Value 'Restart-ANWS'
+
+# Export members
+Export-ModuleMember -Function @(
+    'Install-ANWS',
+    'Set-ANWSRestart',
+    'Uninstall-ANWS',
+    'Restart-ANWS'
+) -Alias @(
+    'Install-ActiveNet',
+    'Uninstall-ActiveNet',
+    'Restart-ActiveNet'
+)
